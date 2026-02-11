@@ -1,0 +1,19 @@
+@inherits LayoutComponentBase
+
+<div class="app-shell">
+    <header class="app-header">
+        <div class="container-xl d-flex justify-content-between align-items-center">
+            <div>
+                <h1 class="brand-title">SchemaFlow</h1>
+                <p class="brand-subtitle">Migracao PostgreSQL de alto volume com COPY BINARY</p>
+            </div>
+            <a class="docs-link" href="https://www.postgresql.org/docs/current/sql-copy.html" target="_blank" rel="noopener noreferrer">
+                Documentacao COPY
+            </a>
+        </div>
+    </header>
+
+    <main class="container-xl app-main">
+        @Body
+    </main>
+</div>

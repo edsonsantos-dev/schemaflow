@@ -1,0 +1,43 @@
+.app-shell {
+    min-height: 100vh;
+    background:
+        radial-gradient(1200px 400px at 10% -10%, rgba(54, 125, 255, 0.18), transparent 60%),
+        radial-gradient(1000px 300px at 100% -10%, rgba(0, 194, 146, 0.14), transparent 60%),
+        linear-gradient(180deg, #f5f8ff 0%, #edf2fb 100%);
+}
+
+.app-header {
+    border-bottom: 1px solid rgba(13, 42, 80, 0.1);
+    background: rgba(255, 255, 255, 0.82);
+    backdrop-filter: blur(8px);
+    position: sticky;
+    top: 0;
+    z-index: 10;
+}
+
+.brand-title {
+    font-size: 1.35rem;
+    margin: 0;
+    letter-spacing: 0.02em;
+}
+
+.brand-subtitle {
+    margin: 0;
+    font-size: 0.85rem;
+    color: #456;
+}
+
+.docs-link {
+    color: #0d4f95;
+    text-decoration: none;
+    font-weight: 600;
+}
+
+.docs-link:hover {
+    text-decoration: underline;
+}
+
+.app-main {
+    padding-top: 1.5rem;
+    padding-bottom: 1.5rem;
+}

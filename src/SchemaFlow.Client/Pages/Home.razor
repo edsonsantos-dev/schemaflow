@@ -1,0 +1,803 @@
+@page "/"
+@implements IAsyncDisposable
+@inject SchemaFlowApiClient ApiClient
+@inject MigrationHubClient HubClient
+
+<PageTitle>SchemaFlow</PageTitle>
+
+<div class="wizard-shell">
+    <div class="stepper">
+        @foreach (var entry in StepLabels)
+        {
+            <div class="step-item @(CurrentStep == entry.Key ? "active" : CurrentStep > entry.Key ? "done" : null)">
+                <span class="step-number">@((int)entry.Key)</span>
+                <span class="step-label">@entry.Value</span>
+            </div>
+        }
+    </div>
+
+    @if (!string.IsNullOrWhiteSpace(ErrorMessage))
+    {
+        <div class="alert alert-danger">@ErrorMessage</div>
+    }
+
+    @if (!string.IsNullOrWhiteSpace(InfoMessage))
+    {
+        <div class="alert alert-info">@InfoMessage</div>
+    }
+
+    @if (CurrentStep == WizardStep.Setup)
+    {
+        <section class="card wizard-card">
+            <div class="card-body">
+                <h2 class="section-title">1. Conexoes</h2>
+                <p class="text-muted">Informe origem e destino, depois valide as duas conexoes.</p>
+
+                <div class="row g-3">
+                    <div class="col-12">
+                        <label class="form-label">PostgreSQL Origem</label>
+                        <textarea class="form-control code-input" rows="3" @bind="SourceConnectionString"></textarea>
+                        <button class="btn btn-outline-primary mt-2" @onclick="TestSourceConnectionAsync" disabled="@IsTestingSource">
+                            @(IsTestingSource ? "Testando..." : "Testar origem")
+                        </button>
+                        @if (SourceConnectionResult is not null)
+                        {
+                            <div class="mt-2 @(SourceConnectionResult.Success ? "text-success" : "text-danger")">
+                                @SourceConnectionResult.Message
+                                @if (SourceConnectionResult.Success)
+                                {
+                                    <span> - @SourceConnectionResult.DatabaseName</span>
+                                }
+                            </div>
+                        }
+                    </div>
+
+                    <div class="col-12">
+                        <label class="form-label">PostgreSQL Destino</label>
+                        <textarea class="form-control code-input" rows="3" @bind="DestinationConnectionString"></textarea>
+                        <button class="btn btn-outline-primary mt-2" @onclick="TestDestinationConnectionAsync" disabled="@IsTestingDestination">
+                            @(IsTestingDestination ? "Testando..." : "Testar destino")
+                        </button>
+                        @if (DestinationConnectionResult is not null)
+                        {
+                            <div class="mt-2 @(DestinationConnectionResult.Success ? "text-success" : "text-danger")">
+                                @DestinationConnectionResult.Message
+                                @if (DestinationConnectionResult.Success)
+                                {
+                                    <span> - @DestinationConnectionResult.DatabaseName</span>
+                                }
+                            </div>
+                        }
+                    </div>
+                </div>
+
+                <div class="wizard-actions">
+                    <button class="btn btn-primary" @onclick="LoadSchemasAsync" disabled="@(!CanContinueFromSetup || IsLoadingSchemas)">
+                        @(IsLoadingSchemas ? "Carregando schemas..." : "Continuar")
+                    </button>
+                </div>
+            </div>
+        </section>
+    }
+
+    @if (CurrentStep == WizardStep.Schemas)
+    {
+        <section class="card wizard-card">
+            <div class="card-body">
+                <h2 class="section-title">2. Schemas</h2>
+                <p class="text-muted">Selecione os schemas de origem.</p>
+
+                @if (IsLoadingSchemas)
+                {
+                    <div>Obtendo schemas...</div>
+                }
+                else if (AvailableSchemas.Count == 0)
+                {
+                    <div class="text-muted">Nenhum schema encontrado.</div>
+                }
+                else
+                {
+                    <div class="toolbar mb-3">
+                        <button class="btn btn-sm btn-outline-primary" @onclick="SelectAllSchemas">Selecionar todos</button>
+                        <button class="btn btn-sm btn-outline-secondary" @onclick="ClearSchemas">Limpar</button>
+                    </div>
+
+                    <div class="schema-list">
+                        @foreach (var schema in AvailableSchemas)
+                        {
+                            <label class="list-item">
+                                <input type="checkbox" checked="@SelectedSchemas.Contains(schema)" @onchange="(e) => ToggleSchema(schema, e)" />
+                                <span>@schema</span>
+                            </label>
+                        }
+                    </div>
+                }
+
+                <div class="wizard-actions">
+                    <button class="btn btn-outline-secondary" @onclick="BackToSetup">Voltar</button>
+                    <button class="btn btn-primary" @onclick="LoadTablesAsync" disabled="@(SelectedSchemas.Count == 0 || IsLoadingTables)">
+                        @(IsLoadingTables ? "Carregando tabelas..." : "Continuar")
+                    </button>
+                </div>
+            </div>
+        </section>
+    }
+
+    @if (CurrentStep == WizardStep.Tables)
+    {
+        <section class="card wizard-card">
+            <div class="card-body">
+                <h2 class="section-title">3. Tabelas</h2>
+                <p class="text-muted">Filtre e selecione as tabelas a migrar.</p>
+
+                @if (IsLoadingTables)
+                {
+                    <div>Obtendo tabelas...</div>
+                }
+                else if (AvailableTables.Count == 0)
+                {
+                    <div class="text-muted">Nenhuma tabela encontrada para os schemas selecionados.</div>
+                }
+                else
+                {
+                    <div class="row g-2 align-items-center mb-3">
+                        <div class="col-lg-6">
+                            <input class="form-control" placeholder="Filtrar por schema ou tabela" @bind="TableFilter" />
+                        </div>
+                        <div class="col-lg-6 text-lg-end">
+                            <button class="btn btn-sm btn-outline-primary me-2" @onclick="SelectAllVisibleTables">Selecionar tudo</button>
+                            <button class="btn btn-sm btn-outline-secondary" @onclick="ClearTableSelection">Limpar selecao</button>
+                        </div>
+                    </div>
+
+                    @foreach (var group in FilteredTableGroups)
+                    {
+                        <div class="table-group">
+                            <h3>@group.Key</h3>
+                            <div class="table-grid">
+                                @foreach (var table in group.OrderBy(t => t.Table.Name, StringComparer.Ordinal))
+                                {
+                                    <label class="list-item">
+                                        <input type="checkbox" checked="@SelectedTables.Contains(table.Table)" @onchange="(e) => ToggleTable(table.Table, e)" />
+                                        <span>@table.Table.Name</span>
+                                        <small class="text-muted">~@(table.EstimatedRows?.ToString("N0") ?? "?") linhas</small>
+                                    </label>
+                                }
+                            </div>
+                        </div>
+                    }
+                }
+
+                <div class="wizard-actions">
+                    <button class="btn btn-outline-secondary" @onclick="BackToSchemas">Voltar</button>
+                    <button class="btn btn-primary" @onclick="ValidateDestinationAsync" disabled="@(SelectedTables.Count == 0 || IsValidating)">
+                        @(IsValidating ? "Validando..." : "Continuar")
+                    </button>
+                </div>
+            </div>
+        </section>
+    }
+
+    @if (CurrentStep == WizardStep.Validation)
+    {
+        <section class="card wizard-card">
+            <div class="card-body">
+                <h2 class="section-title">4. Validacao</h2>
+                <p class="text-muted">Analise diferencas entre origem e destino antes de iniciar a migracao.</p>
+
+                @if (IsValidating)
+                {
+                    <div>Validando destino...</div>
+                }
+                else if (ValidationPlan is null)
+                {
+                    <div class="text-muted">Nenhum plano carregado.</div>
+                }
+                else
+                {
+                    <div class="validation-summary">
+                        <div>
+                            <strong>Schemas faltantes:</strong> @ValidationPlan.MissingSchemas.Count
+                        </div>
+                        <div>
+                            <strong>Tabelas faltantes:</strong> @ValidationPlan.MissingTables.Count
+                        </div>
+                        <div>
+                            <strong>Tabelas com avisos:</strong> @ValidationPlan.TablePlans.Count(p => p.IgnoredColumns.Count > 0 || p.IncompatibleColumns.Count > 0)
+                        </div>
+                    </div>
+
+                    @if (ValidationPlan.MissingSchemas.Count > 0 || ValidationPlan.MissingTables.Count > 0)
+                    {
+                        <div class="alert alert-warning mt-3">
+                            Existem estruturas faltantes no destino.
+                        </div>
+
+                        <div class="form-check">
+                            <input id="createSchemas" class="form-check-input" type="checkbox" @bind="CreateMissingSchemas" />
+                            <label for="createSchemas" class="form-check-label">Criar schemas faltantes</label>
+                        </div>
+                        <div class="form-check mb-2">
+                            <input id="createTables" class="form-check-input" type="checkbox" @bind="CreateMissingTables" />
+                            <label for="createTables" class="form-check-label">Criar tabelas faltantes</label>
+                        </div>
+
+                        <button class="btn btn-outline-primary btn-sm" @onclick="ProvisionStructureAsync" disabled="@IsProvisioning">
+                            @(IsProvisioning ? "Aplicando..." : "Aplicar criacao de estrutura")
+                        </button>
+                    }
+
+                    <div class="table mt-3">
+                        @foreach (var plan in ValidationPlan.TablePlans.OrderBy(p => p.Table.Schema).ThenBy(p => p.Table.Name))
+                        {
+                            <div class="validation-item">
+                                <div class="validation-header">
+                                    <strong>@plan.Table.QualifiedName</strong>
+                                    <span class="badge text-bg-light">@((plan.DestinationTableExists ? "Destino existente" : "Tabela sera criada"))</span>
+                                </div>
+                                <div class="validation-body">
+                                    <span>Migraveis: @plan.MigratableColumns.Count</span>
+                                    <span>Ignoradas: @plan.IgnoredColumns.Count</span>
+                                    <span>Incompativeis: @plan.IncompatibleColumns.Count</span>
+                                </div>
+
+                                @if (plan.IgnoredColumns.Count > 0)
+                                {
+                                    <div class="warning-line">Ignoradas: @string.Join(", ", plan.IgnoredColumns)</div>
+                                }
+
+                                @if (plan.IncompatibleColumns.Count > 0)
+                                {
+                                    <div class="warning-line">
+                                        Incompativeis: @string.Join(", ", plan.IncompatibleColumns.Select(c => $"{c.Column} ({c.SourceType} -> {c.DestinationType})"))
+                                    </div>
+                                }
+                            </div>
+                        }
+                    </div>
+
+                    @if (ValidationPlan.TablePlans.Any(plan => plan.IgnoredColumns.Count > 0 || plan.IncompatibleColumns.Count > 0))
+                    {
+                        <div class="form-check mt-3">
+                            <input id="confirmWarnings" class="form-check-input" type="checkbox" @bind="ConfirmWarnings" />
+                            <label for="confirmWarnings" class="form-check-label">Confirmo que desejo continuar mesmo com colunas ignoradas/incompativeis</label>
+                        </div>
+                    }
+
+                    <div class="row g-2 mt-2">
+                        <div class="col-md-4">
+                            <label class="form-label">Paralelismo por tabela (1 a 16)</label>
+                            <input class="form-control" type="number" min="1" max="16" @bind="MaxParallelism" />
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label">Modo de carga</label>
+                            <select class="form-select" @bind="LoadMode">
+                                <option value="@MigrationLoadMode.Append">Append</option>
+                                <option value="@MigrationLoadMode.TruncateBeforeLoad">TruncateBeforeLoad</option>
+                            </select>
+                        </div>
+                    </div>
+                }
+
+                <div class="wizard-actions">
+                    <button class="btn btn-outline-secondary" @onclick="BackToTables">Voltar</button>
+                    <button class="btn btn-primary" @onclick="StartMigrationAsync" disabled="@(ValidationPlan is null || IsStartingMigration)">
+                        @(IsStartingMigration ? "Iniciando..." : "Iniciar migracao")
+                    </button>
+                </div>
+            </div>
+        </section>
+    }
+
+    @if (CurrentStep == WizardStep.Migration || CurrentStep == WizardStep.Summary)
+    {
+        <section class="card wizard-card">
+            <div class="card-body">
+                <h2 class="section-title">5. Migracao</h2>
+
+                @if (CurrentSnapshot is null)
+                {
+                    <div>Aguardando dados do job...</div>
+                }
+                else
+                {
+                    <div class="global-metrics">
+                        <div><strong>Status:</strong> @CurrentSnapshot.Status</div>
+                        <div><strong>Tabelas:</strong> @CurrentSnapshot.CompletedTables / @CurrentSnapshot.TotalTables</div>
+                        <div><strong>Falhas:</strong> @CurrentSnapshot.FailedTables</div>
+                        <div><strong>Linhas processadas:</strong> @CurrentSnapshot.ProcessedRows.ToString("N0")</div>
+                        <div><strong>Throughput:</strong> @CurrentSnapshot.ThroughputRowsPerSecond.ToString("N0") rows/s</div>
+                    </div>
+
+                    <div class="progress mt-3" style="height: 20px;">
+                        <div class="progress-bar" role="progressbar" style="width: @GlobalProgressPercent.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture)%">
+                            @GlobalProgressPercent.ToString("0.##")%
+                        </div>
+                    </div>
+
+                    <div class="table-status-list mt-3">
+                        @foreach (var table in CurrentSnapshot.Tables)
+                        {
+                            <div class="status-item">
+                                <div class="status-header">
+                                    <strong>@table.Table.QualifiedName</strong>
+                                    <span class="badge @GetStatusBadgeClass(table.Status)">@table.Status</span>
+                                </div>
+                                <div class="status-metrics">
+                                    <span>@table.ProcessedRows.ToString("N0") linhas</span>
+                                    <span>~@(table.EstimatedRows?.ToString("N0") ?? "?") estimadas</span>
+                                    <span>@table.RowsPerSecond.ToString("N0") rows/s</span>
+                                </div>
+                                <div class="progress" style="height: 10px;">
+                                    <div class="progress-bar" role="progressbar" style="width: @table.ProgressPercent.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture)%"></div>
+                                </div>
+                                @if (!string.IsNullOrWhiteSpace(table.Message))
+                                {
+                                    <small class="text-muted">@table.Message</small>
+                                }
+                            </div>
+                        }
+                    </div>
+                }
+
+                @if (CurrentStep == WizardStep.Summary && CurrentSnapshot is not null)
+                {
+                    <h2 class="section-title mt-4">6. Resumo</h2>
+                    <div class="alert @(CurrentSnapshot.FailedTables > 0 ? "alert-warning" : "alert-success")">
+                        Job @CurrentSnapshot.JobId finalizado com status <strong>@CurrentSnapshot.Status</strong>.
+                    </div>
+                }
+            </div>
+        </section>
+    }
+</div>
+
+@code {
+    private enum WizardStep
+    {
+        Setup = 1,
+        Schemas = 2,
+        Tables = 3,
+        Validation = 4,
+        Migration = 5,
+        Summary = 6
+    }
+
+    private static readonly IReadOnlyDictionary<WizardStep, string> StepLabels = new Dictionary<WizardStep, string>
+    {
+        [WizardStep.Setup] = "Setup",
+        [WizardStep.Schemas] = "Schemas",
+        [WizardStep.Tables] = "Tabelas",
+        [WizardStep.Validation] = "Validacao",
+        [WizardStep.Migration] = "Migracao",
+        [WizardStep.Summary] = "Resumo"
+    };
+
+    private WizardStep CurrentStep { get; set; } = WizardStep.Setup;
+
+    private string SourceConnectionString { get; set; } = string.Empty;
+    private string DestinationConnectionString { get; set; } = string.Empty;
+    private ConnectionTestResponse? SourceConnectionResult { get; set; }
+    private ConnectionTestResponse? DestinationConnectionResult { get; set; }
+    private bool IsTestingSource { get; set; }
+    private bool IsTestingDestination { get; set; }
+
+    private bool IsLoadingSchemas { get; set; }
+    private List<string> AvailableSchemas { get; } = [];
+    private HashSet<string> SelectedSchemas { get; } = new(StringComparer.Ordinal);
+
+    private bool IsLoadingTables { get; set; }
+    private List<TableMetadata> AvailableTables { get; } = [];
+    private HashSet<TableIdentifier> SelectedTables { get; } = [];
+    private string TableFilter { get; set; } = string.Empty;
+
+    private bool IsValidating { get; set; }
+    private ValidationResponse? ValidationPlan { get; set; }
+    private bool CreateMissingSchemas { get; set; } = true;
+    private bool CreateMissingTables { get; set; } = true;
+    private bool ConfirmWarnings { get; set; }
+    private bool IsProvisioning { get; set; }
+
+    private int MaxParallelism { get; set; } = 4;
+    private MigrationLoadMode LoadMode { get; set; } = MigrationLoadMode.Append;
+    private bool IsStartingMigration { get; set; }
+
+    private Guid? CurrentJobId { get; set; }
+    private MigrationJobSnapshot? CurrentSnapshot { get; set; }
+    private CancellationTokenSource? PollingCts { get; set; }
+
+    private string? ErrorMessage { get; set; }
+    private string? InfoMessage { get; set; }
+
+    private bool CanContinueFromSetup =>
+        SourceConnectionResult?.Success == true &&
+        DestinationConnectionResult?.Success == true;
+
+    private IEnumerable<IGrouping<string, TableMetadata>> FilteredTableGroups =>
+        AvailableTables
+            .Where(t => string.IsNullOrWhiteSpace(TableFilter) ||
+                        t.Table.Schema.Contains(TableFilter, StringComparison.OrdinalIgnoreCase) ||
+                        t.Table.Name.Contains(TableFilter, StringComparison.OrdinalIgnoreCase))
+            .GroupBy(t => t.Table.Schema)
+            .OrderBy(group => group.Key, StringComparer.Ordinal);
+
+    private double GlobalProgressPercent => CurrentSnapshot is null || CurrentSnapshot.TotalTables == 0
+        ? 0
+        : (CurrentSnapshot.CompletedTables + CurrentSnapshot.FailedTables) * 100d / CurrentSnapshot.TotalTables;
+
+    protected override void OnInitialized()
+    {
+        HubClient.ProgressReceived += HandleProgressAsync;
+    }
+
+    private async Task HandleProgressAsync(MigrationProgressEvent progress)
+    {
+        if (CurrentJobId != progress.JobId)
+        {
+            return;
+        }
+
+        await RefreshSnapshotAsync(progress.JobId);
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private async Task TestSourceConnectionAsync()
+    {
+        await ExecuteSafeAsync(async () =>
+        {
+            IsTestingSource = true;
+            SourceConnectionResult = await ApiClient.TestConnectionAsync(SourceConnectionString);
+        });
+
+        IsTestingSource = false;
+    }
+
+    private async Task TestDestinationConnectionAsync()
+    {
+        await ExecuteSafeAsync(async () =>
+        {
+            IsTestingDestination = true;
+            DestinationConnectionResult = await ApiClient.TestConnectionAsync(DestinationConnectionString);
+        });
+
+        IsTestingDestination = false;
+    }
+
+    private async Task LoadSchemasAsync()
+    {
+        await ExecuteSafeAsync(async () =>
+        {
+            if (!CanContinueFromSetup)
+            {
+                throw new InvalidOperationException("Teste as duas conexoes antes de continuar.");
+            }
+
+            IsLoadingSchemas = true;
+            AvailableSchemas.Clear();
+            SelectedSchemas.Clear();
+
+            var response = await ApiClient.DiscoverSchemasAsync(SourceConnectionString);
+            AvailableSchemas.AddRange(response.Schemas);
+
+            if (AvailableSchemas.Count == 0)
+            {
+                throw new InvalidOperationException("Nenhum schema relevante encontrado na origem.");
+            }
+
+            if (AvailableSchemas.Count == 1)
+            {
+                SelectedSchemas.Add(AvailableSchemas[0]);
+                InfoMessage = $"Schema unico identificado ({AvailableSchemas[0]}). Selecao automatica aplicada.";
+                await LoadTablesAsync();
+                return;
+            }
+
+            CurrentStep = WizardStep.Schemas;
+        });
+
+        IsLoadingSchemas = false;
+    }
+
+    private async Task LoadTablesAsync()
+    {
+        await ExecuteSafeAsync(async () =>
+        {
+            if (SelectedSchemas.Count == 0)
+            {
+                throw new InvalidOperationException("Selecione ao menos um schema.");
+            }
+
+            IsLoadingTables = true;
+            AvailableTables.Clear();
+            SelectedTables.Clear();
+
+            var response = await ApiClient.DiscoverTablesAsync(SourceConnectionString, SelectedSchemas.ToArray());
+            AvailableTables.AddRange(response.Tables);
+
+            if (AvailableTables.Count == 0)
+            {
+                throw new InvalidOperationException("Nenhuma tabela encontrada para os schemas selecionados.");
+            }
+
+            CurrentStep = WizardStep.Tables;
+        });
+
+        IsLoadingTables = false;
+    }
+
+    private async Task ValidateDestinationAsync()
+    {
+        await ExecuteSafeAsync(async () =>
+        {
+            IsValidating = true;
+
+            var request = new ValidationRequest(
+                SourceConnectionString,
+                DestinationConnectionString,
+                SelectedTables.OrderBy(t => t.Schema).ThenBy(t => t.Name).ToArray());
+
+            ValidationPlan = await ApiClient.BuildValidationPlanAsync(request);
+            ConfirmWarnings = !ValidationPlan.TablePlans.Any(plan =>
+                plan.IgnoredColumns.Count > 0 || plan.IncompatibleColumns.Count > 0);
+
+            CurrentStep = WizardStep.Validation;
+        });
+
+        IsValidating = false;
+    }
+
+    private async Task ProvisionStructureAsync()
+    {
+        await ExecuteSafeAsync(async () =>
+        {
+            if (ValidationPlan is null)
+            {
+                throw new InvalidOperationException("Valide o destino antes de provisionar estrutura.");
+            }
+
+            IsProvisioning = true;
+
+            var schemasToCreate = CreateMissingSchemas ? ValidationPlan.MissingSchemas.ToArray() : [];
+            var tablesToCreate = CreateMissingTables ? ValidationPlan.MissingTables.ToArray() : [];
+
+            if (schemasToCreate.Length == 0 && tablesToCreate.Length == 0)
+            {
+                InfoMessage = "Nenhuma estrutura selecionada para criacao.";
+                return;
+            }
+
+            var provisionRequest = new StructureProvisionRequest(
+                SourceConnectionString,
+                DestinationConnectionString,
+                schemasToCreate,
+                tablesToCreate);
+
+            var response = await ApiClient.ProvisionAsync(provisionRequest);
+
+            InfoMessage =
+                $"Provisionamento concluido. Schemas criados: {response.CreatedSchemas.Count}, tabelas criadas: {response.CreatedTables.Count}.";
+
+            if (response.Errors.Count > 0)
+            {
+                ErrorMessage = string.Join(" | ", response.Errors);
+            }
+
+            await ValidateDestinationAsync();
+        });
+
+        IsProvisioning = false;
+    }
+
+    private async Task StartMigrationAsync()
+    {
+        await ExecuteSafeAsync(async () =>
+        {
+            if (ValidationPlan is null)
+            {
+                throw new InvalidOperationException("Valide o destino antes de iniciar a migracao.");
+            }
+
+            if (ValidationPlan.MissingSchemas.Count > 0 || ValidationPlan.MissingTables.Count > 0)
+            {
+                throw new InvalidOperationException("Ainda existem schemas/tabelas faltantes no destino. Provisione ou ajuste antes de continuar.");
+            }
+
+            var hasWarnings = ValidationPlan.TablePlans.Any(plan =>
+                plan.IgnoredColumns.Count > 0 || plan.IncompatibleColumns.Count > 0);
+
+            if (hasWarnings && !ConfirmWarnings)
+            {
+                throw new InvalidOperationException("Confirme a continuidade com colunas ignoradas/incompativeis.");
+            }
+
+            IsStartingMigration = true;
+
+            var estimatesByTable = AvailableTables.ToDictionary(table => table.Table, table => table.EstimatedRows);
+
+            var tables = ValidationPlan.TablePlans
+                .OrderBy(plan => plan.Table.Schema)
+                .ThenBy(plan => plan.Table.Name)
+                .Select(plan => new TableMigrationRequest(
+                    plan.Table,
+                    plan.MigratableColumns,
+                    estimatesByTable.TryGetValue(plan.Table, out var estimate) ? estimate : null))
+                .ToArray();
+
+            var request = new MigrationStartRequest(
+                SourceConnectionString,
+                DestinationConnectionString,
+                tables,
+                Math.Clamp(MaxParallelism, 1, 16),
+                LoadMode);
+
+            var response = await ApiClient.StartMigrationAsync(request);
+            CurrentJobId = response.JobId;
+
+            await HubClient.ConnectAsync();
+            await HubClient.JoinJobAsync(response.JobId);
+
+            CurrentStep = WizardStep.Migration;
+            await RefreshSnapshotAsync(response.JobId);
+            StartPolling(response.JobId);
+        });
+
+        IsStartingMigration = false;
+    }
+
+    private void StartPolling(Guid jobId)
+    {
+        StopPolling();
+
+        var cts = new CancellationTokenSource();
+        PollingCts = cts;
+
+        _ = Task.Run(async () =>
+        {
+            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(2));
+
+            try
+            {
+                while (await timer.WaitForNextTickAsync(cts.Token))
+                {
+                    await RefreshSnapshotAsync(jobId, cts.Token);
+                    await InvokeAsync(StateHasChanged);
+
+                    if (CurrentSnapshot is not null && IsFinalStatus(CurrentSnapshot.Status))
+                    {
+                        break;
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        });
+    }
+
+    private void StopPolling()
+    {
+        if (PollingCts is null)
+        {
+            return;
+        }
+
+        PollingCts.Cancel();
+        PollingCts.Dispose();
+        PollingCts = null;
+    }
+
+    private async Task RefreshSnapshotAsync(Guid? jobId = null, CancellationToken cancellationToken = default)
+    {
+        var effectiveJobId = jobId ?? CurrentJobId;
+        if (effectiveJobId is null)
+        {
+            return;
+        }
+
+        CurrentSnapshot = await ApiClient.GetMigrationSnapshotAsync(effectiveJobId.Value, cancellationToken);
+
+        if (IsFinalStatus(CurrentSnapshot.Status))
+        {
+            CurrentStep = WizardStep.Summary;
+            StopPolling();
+        }
+    }
+
+    private static bool IsFinalStatus(MigrationJobStatus status)
+    {
+        return status is MigrationJobStatus.Completed or
+            MigrationJobStatus.CompletedWithErrors or
+            MigrationJobStatus.Failed or
+            MigrationJobStatus.Canceled;
+    }
+
+    private void SelectAllSchemas()
+    {
+        SelectedSchemas.Clear();
+        foreach (var schema in AvailableSchemas)
+        {
+            SelectedSchemas.Add(schema);
+        }
+    }
+
+    private void ClearSchemas() => SelectedSchemas.Clear();
+
+    private void ToggleSchema(string schema, ChangeEventArgs args)
+    {
+        if (args.Value as bool? == true)
+        {
+            SelectedSchemas.Add(schema);
+        }
+        else
+        {
+            SelectedSchemas.Remove(schema);
+        }
+    }
+
+    private void ToggleTable(TableIdentifier table, ChangeEventArgs args)
+    {
+        if (args.Value as bool? == true)
+        {
+            SelectedTables.Add(table);
+        }
+        else
+        {
+            SelectedTables.Remove(table);
+        }
+    }
+
+    private void SelectAllVisibleTables()
+    {
+        foreach (var table in FilteredTableGroups.SelectMany(group => group))
+        {
+            SelectedTables.Add(table.Table);
+        }
+    }
+
+    private void ClearTableSelection() => SelectedTables.Clear();
+
+    private void BackToSetup() => CurrentStep = WizardStep.Setup;
+
+    private void BackToSchemas() => CurrentStep = WizardStep.Schemas;
+
+    private void BackToTables() => CurrentStep = WizardStep.Tables;
+
+    private string GetStatusBadgeClass(TableMigrationStatus status) => status switch
+    {
+        TableMigrationStatus.Completed => "text-bg-success",
+        TableMigrationStatus.Failed => "text-bg-danger",
+        TableMigrationStatus.Retrying => "text-bg-warning",
+        TableMigrationStatus.Running => "text-bg-primary",
+        TableMigrationStatus.Skipped => "text-bg-secondary",
+        _ => "text-bg-light"
+    };
+
+    private async Task ExecuteSafeAsync(Func<Task> action)
+    {
+        ErrorMessage = null;
+        InfoMessage = null;
+
+        try
+        {
+            await action();
+        }
+        catch (Exception ex)
+        {
+            ErrorMessage = ex.Message;
+        }
+
+        await InvokeAsync(StateHasChanged);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        StopPolling();
+
+        if (CurrentJobId.HasValue)
+        {
+            await HubClient.LeaveJobAsync(CurrentJobId.Value);
+        }
+
+        HubClient.ProgressReceived -= HandleProgressAsync;
+    }
+}
