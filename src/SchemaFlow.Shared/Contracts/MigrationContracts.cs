@@ -30,7 +30,9 @@ public record ColumnMetadata(
     string TypeDefinition,
     bool IsNullable,
     string? DefaultExpression,
-    int OrdinalPosition);
+    int OrdinalPosition,
+    bool IsGenerated,
+    bool IsIdentity);
 
 public record ColumnCompatibilityIssue(
     string Column,
@@ -109,9 +111,24 @@ public enum TableMigrationStatus
     Skipped = 5
 }
 
+public enum TableMigrationPhase
+{
+    Pending = 0,
+    Preparing = 1,
+    ReadingSource = 2,
+    WritingDestination = 3,
+    CompletingCopy = 4,
+    Committing = 5,
+    Retrying = 6,
+    Failed = 7,
+    Completed = 8,
+    Skipped = 9
+}
+
 public record TableProgressSnapshot(
     TableIdentifier Table,
     TableMigrationStatus Status,
+    TableMigrationPhase Phase,
     int Attempt,
     long ProcessedRows,
     long? EstimatedRows,

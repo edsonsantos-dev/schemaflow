@@ -128,7 +128,9 @@ public sealed class PostgresMetadataService
                    a.attnum AS ordinal_position,
                    pg_catalog.format_type(a.atttypid, a.atttypmod) AS formatted_type,
                    a.attnotnull AS is_not_null,
-                   pg_catalog.pg_get_expr(ad.adbin, ad.adrelid) AS default_expr
+                   pg_catalog.pg_get_expr(ad.adbin, ad.adrelid) AS default_expr,
+                   (a.attgenerated <> '') AS is_generated,
+                   (a.attidentity <> '') AS is_identity
             FROM pg_attribute a
             INNER JOIN pg_class c ON c.oid = a.attrelid
             INNER JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -168,7 +170,9 @@ public sealed class PostgresMetadataService
                 reader.GetString(4),
                 !reader.GetBoolean(5),
                 reader.IsDBNull(6) ? null : reader.GetString(6),
-                reader.GetInt16(3)));
+                reader.GetInt16(3),
+                reader.GetBoolean(7),
+                reader.GetBoolean(8)));
         }
 
         return result.ToDictionary(kvp => kvp.Key, kvp => (IReadOnlyList<ColumnMetadata>)kvp.Value);

@@ -97,6 +97,26 @@ public sealed class ValidationService
                     continue;
                 }
 
+                if (destinationColumn.IsGenerated)
+                {
+                    incompatible.Add(new ColumnCompatibilityIssue(
+                        sourceColumn.Name,
+                        sourceColumn.TypeDefinition,
+                        destinationColumn.TypeDefinition,
+                        "Coluna gerada no destino (somente leitura)."));
+                    continue;
+                }
+
+                if (destinationColumn.IsIdentity)
+                {
+                    incompatible.Add(new ColumnCompatibilityIssue(
+                        sourceColumn.Name,
+                        sourceColumn.TypeDefinition,
+                        destinationColumn.TypeDefinition,
+                        "Coluna identity no destino sem suporte a OVERRIDING SYSTEM VALUE no fluxo atual."));
+                    continue;
+                }
+
                 if (!AreTypesCompatible(sourceColumn.TypeDefinition, destinationColumn.TypeDefinition))
                 {
                     incompatible.Add(new ColumnCompatibilityIssue(

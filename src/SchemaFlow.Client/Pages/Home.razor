@@ -249,7 +249,7 @@
                                 @if (plan.IncompatibleColumns.Count > 0)
                                 {
                                     <div class="warning-line">
-                                        Incompativeis: @string.Join(", ", plan.IncompatibleColumns.Select(c => $"{c.Column} ({c.SourceType} -> {c.DestinationType})"))
+                                        Incompativeis: @string.Join(", ", plan.IncompatibleColumns.Select(c => $"{c.Column} ({c.SourceType} -> {c.DestinationType}) - {c.Reason}"))
                                     </div>
                                 }
                             </div>
@@ -327,6 +327,7 @@
                                     <span>@table.ProcessedRows.ToString("N0") linhas</span>
                                     <span>~@(table.EstimatedRows?.ToString("N0") ?? "?") estimadas</span>
                                     <span>@table.RowsPerSecond.ToString("N0") rows/s</span>
+                                    <span><strong>Fase:</strong> @GetPhaseLabel(table.Phase)</span>
                                 </div>
                                 <div class="progress" style="height: 10px;">
                                     <div class="progress-bar" role="progressbar" style="width: @table.ProgressPercent.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture)%"></div>
@@ -770,6 +771,20 @@
         TableMigrationStatus.Running => "text-bg-primary",
         TableMigrationStatus.Skipped => "text-bg-secondary",
         _ => "text-bg-light"
+    };
+
+    private static string GetPhaseLabel(TableMigrationPhase phase) => phase switch
+    {
+        TableMigrationPhase.Preparing => "Preparando",
+        TableMigrationPhase.ReadingSource => "Lendo origem",
+        TableMigrationPhase.WritingDestination => "Gravando destino",
+        TableMigrationPhase.CompletingCopy => "Finalizando COPY",
+        TableMigrationPhase.Committing => "Confirmando transacao",
+        TableMigrationPhase.Retrying => "Retentando",
+        TableMigrationPhase.Completed => "Concluida",
+        TableMigrationPhase.Failed => "Falhou",
+        TableMigrationPhase.Skipped => "Ignorada",
+        _ => "Pendente"
     };
 
     private async Task ExecuteSafeAsync(Func<Task> action)

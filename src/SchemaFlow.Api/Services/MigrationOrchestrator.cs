@@ -110,6 +110,7 @@ public sealed class MigrationOrchestrator
             var skipped = job.UpdateTable(
                 tableRequest.Table,
                 TableMigrationStatus.Skipped,
+                TableMigrationPhase.Skipped,
                 attempt: 1,
                 message: "Sem colunas compativeis para migracao.");
             await PublishProgressAsync(job, skipped, cancellationToken);
@@ -121,13 +122,14 @@ public sealed class MigrationOrchestrator
             var runningStatus = job.UpdateTable(
                 tableRequest.Table,
                 attempt == 1 ? TableMigrationStatus.Running : TableMigrationStatus.Retrying,
+                attempt == 1 ? TableMigrationPhase.Preparing : TableMigrationPhase.Retrying,
                 attempt,
                 attempt == 1 ? "Migracao iniciada." : "Nova tentativa em execucao.");
             await PublishProgressAsync(job, runningStatus, cancellationToken);
 
             try
             {
-                var copiedRows = await MigrateTableAsync(job, request, tableRequest, cancellationToken);
+                var copiedRows = await MigrateTableAsync(job, request, tableRequest, attempt, cancellationToken);
 
                 var completed = job.MarkTableCompleted(
                     tableRequest.Table,
@@ -150,6 +152,7 @@ public sealed class MigrationOrchestrator
                 var retrying = job.UpdateTable(
                     tableRequest.Table,
                     TableMigrationStatus.Retrying,
+                    TableMigrationPhase.Retrying,
                     attempt,
                     $"Erro transitorio: {ex.Message}");
 
@@ -175,6 +178,7 @@ public sealed class MigrationOrchestrator
         MigrationJobRuntime job,
         MigrationStartRequest request,
         TableMigrationRequest tableRequest,
+        int attempt,
         CancellationToken cancellationToken)
     {
         var columns = tableRequest.ColumnsToMigrate
@@ -186,6 +190,14 @@ public sealed class MigrationOrchestrator
 
         var selectSql = $"SELECT {quotedColumns} FROM {qualifiedTable};";
         var copySql = $"COPY {qualifiedTable} ({quotedColumns}) FROM STDIN (FORMAT BINARY);";
+
+        var preparing = job.UpdateTable(
+            tableRequest.Table,
+            TableMigrationStatus.Running,
+            TableMigrationPhase.Preparing,
+            attempt,
+            message: "Preparando conexoes e transacao.");
+        await PublishProgressAsync(job, preparing, cancellationToken);
 
         await using var sourceConnection = new NpgsqlConnection(request.SourceConnectionString);
         await sourceConnection.OpenAsync(cancellationToken);
@@ -207,54 +219,99 @@ public sealed class MigrationOrchestrator
             await using var sourceCommand = new NpgsqlCommand(selectSql, sourceConnection);
             await using var sourceReader = await sourceCommand.ExecuteReaderAsync(CommandBehavior.SequentialAccess, cancellationToken);
 
-            await using var binaryImporter = destinationConnection.BeginBinaryImport(copySql);
+            var reading = job.UpdateTable(
+                tableRequest.Table,
+                TableMigrationStatus.Running,
+                TableMigrationPhase.ReadingSource,
+                attempt,
+                message: "Lendo registros da origem.");
+            await PublishProgressAsync(job, reading, cancellationToken);
 
             long totalCopiedRows = 0;
             long rowsSinceLastEvent = 0;
             var lastProgressPush = Stopwatch.StartNew();
 
-            while (await sourceReader.ReadAsync(cancellationToken))
+            await using (var binaryImporter = destinationConnection.BeginBinaryImport(copySql))
             {
-                binaryImporter.StartRow();
+                var writing = job.UpdateTable(
+                    tableRequest.Table,
+                    TableMigrationStatus.Running,
+                    TableMigrationPhase.WritingDestination,
+                    attempt,
+                    message: "Gravando registros no destino (COPY BINARY).");
+                await PublishProgressAsync(job, writing, cancellationToken);
 
-                for (var index = 0; index < columns.Length; index++)
+                while (await sourceReader.ReadAsync(cancellationToken))
                 {
-                    if (await sourceReader.IsDBNullAsync(index, cancellationToken))
+                    binaryImporter.StartRow();
+
+                    for (var index = 0; index < columns.Length; index++)
                     {
-                        binaryImporter.WriteNull();
-                        continue;
+                        if (await sourceReader.IsDBNullAsync(index, cancellationToken))
+                        {
+                            binaryImporter.WriteNull();
+                            continue;
+                        }
+
+                        binaryImporter.Write(sourceReader.GetValue(index));
                     }
 
-                    binaryImporter.Write(sourceReader.GetValue(index));
+                    totalCopiedRows++;
+                    rowsSinceLastEvent++;
+
+                    if (rowsSinceLastEvent >= 1_000 || lastProgressPush.Elapsed >= TimeSpan.FromSeconds(1))
+                    {
+                        var tableProgress = job.AddProcessedRows(tableRequest.Table, rowsSinceLastEvent);
+                        await PublishProgressAsync(job, tableProgress, cancellationToken);
+
+                        rowsSinceLastEvent = 0;
+                        lastProgressPush.Restart();
+                    }
                 }
 
-                totalCopiedRows++;
-                rowsSinceLastEvent++;
-
-                if (rowsSinceLastEvent >= 1_000 || lastProgressPush.Elapsed >= TimeSpan.FromSeconds(1))
+                if (rowsSinceLastEvent > 0)
                 {
                     var tableProgress = job.AddProcessedRows(tableRequest.Table, rowsSinceLastEvent);
                     await PublishProgressAsync(job, tableProgress, cancellationToken);
-
-                    rowsSinceLastEvent = 0;
-                    lastProgressPush.Restart();
                 }
+
+                var completing = job.UpdateTable(
+                    tableRequest.Table,
+                    TableMigrationStatus.Running,
+                    TableMigrationPhase.CompletingCopy,
+                    attempt,
+                    message: "Finalizando stream COPY.");
+                await PublishProgressAsync(job, completing, cancellationToken);
+
+                await binaryImporter.CompleteAsync(cancellationToken);
             }
 
-            if (rowsSinceLastEvent > 0)
-            {
-                var tableProgress = job.AddProcessedRows(tableRequest.Table, rowsSinceLastEvent);
-                await PublishProgressAsync(job, tableProgress, cancellationToken);
-            }
+            var committing = job.UpdateTable(
+                tableRequest.Table,
+                TableMigrationStatus.Running,
+                TableMigrationPhase.Committing,
+                attempt,
+                message: "Confirmando transacao no destino.");
+            await PublishProgressAsync(job, committing, cancellationToken);
 
-            binaryImporter.Complete();
             await transaction.CommitAsync(cancellationToken);
 
             return totalCopiedRows;
         }
-        catch
+        catch (Exception)
         {
-            await transaction.RollbackAsync(cancellationToken);
+            try
+            {
+                await transaction.RollbackAsync(cancellationToken);
+            }
+            catch (Exception rollbackException)
+            {
+                _logger.LogWarning(
+                    rollbackException,
+                    "Rollback falhou para a tabela {Table}. O erro original sera preservado.",
+                    tableRequest.Table.QualifiedName);
+            }
+
             throw;
         }
     }
@@ -291,6 +348,21 @@ public sealed class MigrationOrchestrator
 
     private static bool IsTransient(Exception exception)
     {
+        if (exception is NpgsqlOperationInProgressException)
+        {
+            return false;
+        }
+
+        if (exception is ObjectDisposedException)
+        {
+            return false;
+        }
+
+        if (exception is PostgresException postgresException && postgresException.SqlState == "42P10")
+        {
+            return false;
+        }
+
         if (exception is TimeoutException)
         {
             return true;
@@ -326,6 +398,7 @@ public sealed class MigrationOrchestrator
                 table => new TableRuntimeState(
                     table.Table,
                     TableMigrationStatus.Pending,
+                    TableMigrationPhase.Pending,
                     0,
                     0,
                     table.EstimatedRows,
@@ -356,6 +429,7 @@ public sealed class MigrationOrchestrator
         public TableProgressSnapshot UpdateTable(
             TableIdentifier table,
             TableMigrationStatus status,
+            TableMigrationPhase phase,
             int attempt,
             string? message)
         {
@@ -366,10 +440,12 @@ public sealed class MigrationOrchestrator
                 var updated = current with
                 {
                     Status = status,
+                    Phase = phase,
                     Attempt = attempt,
                     Message = message,
                     UpdatedAt = now,
                     LastAttemptStartedAt = status is TableMigrationStatus.Running or TableMigrationStatus.Retrying
+                        && (current.Attempt != attempt || current.LastAttemptStartedAt is null)
                         ? now
                         : current.LastAttemptStartedAt
                 };
@@ -388,6 +464,7 @@ public sealed class MigrationOrchestrator
                 var updated = current with
                 {
                     ProcessedRows = current.ProcessedRows + delta,
+                    Phase = TableMigrationPhase.WritingDestination,
                     UpdatedAt = now
                 };
 
@@ -405,6 +482,7 @@ public sealed class MigrationOrchestrator
                 var updated = current with
                 {
                     Status = TableMigrationStatus.Completed,
+                    Phase = TableMigrationPhase.Completed,
                     Attempt = attempt,
                     ProcessedRows = Math.Max(current.ProcessedRows, totalRows),
                     Message = message,
@@ -425,6 +503,7 @@ public sealed class MigrationOrchestrator
                 var updated = current with
                 {
                     Status = TableMigrationStatus.Failed,
+                    Phase = TableMigrationPhase.Failed,
                     Attempt = attempt,
                     Message = message,
                     UpdatedAt = now
@@ -477,6 +556,7 @@ public sealed class MigrationOrchestrator
         private sealed record TableRuntimeState(
             TableIdentifier Table,
             TableMigrationStatus Status,
+            TableMigrationPhase Phase,
             int Attempt,
             long ProcessedRows,
             long? EstimatedRows,
@@ -499,6 +579,7 @@ public sealed class MigrationOrchestrator
                 return new TableProgressSnapshot(
                     Table,
                     Status,
+                    Phase,
                     Attempt,
                     ProcessedRows,
                     EstimatedRows,
